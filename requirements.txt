@@ -2,3 +2,4 @@ streamlit>=1.36
 pandas>=2.1
 openpyxl>=3.1
 xlsxwriter>=3.2
+pdfminer.six>=20240706
