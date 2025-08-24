@@ -243,16 +243,21 @@ def main():
     st.title(APP_TITLE)
     st.caption("Upload → Auto-detect (Predict & Motorină) → Auto-save → Statistici → Excel live")
 
-    # CSS: ascunde complet zona de drag&drop (rămâne DOAR butonul de selectare fișier)
+    # CSS: păstrează butonul „Alege fișier”, ascunde chenarul & textul de drag&drop
     st.markdown("""
     <style>
-    [data-testid="stFileUploader"] div[role="button"] {margin-top:0.25rem;}
-    /* ascunde dropzone-ul și mesajele de drag&drop */
-    [data-testid="stFileUploaderDropzone"] { display: none !important; }
-    [data-testid="stFileUploader"] .stFileDropzone { display: none !important; }
-    [data-testid="stFileUploader"] .uploadFile { display: none !important; }
-    /* micșorează spațiul rămas */
-    [data-testid="stFileUploader"] > div { padding: 0 !important; }
+    [data-testid="stFileUploaderDropzone"] {
+      border: none !important;
+      background: transparent !important;
+      padding: 0 !important;
+    }
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderInstructions"],
+    [data-testid="stFileUploader"] .uploadFile {
+      display: none !important;
+    }
+    [data-testid="stFileUploader"] div[role="button"] {
+      margin: 0.25rem 0 0 0;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -269,7 +274,6 @@ def main():
         st.info("Bonurile de motorină sunt deseori pentru **ziua precedentă** – le mapez automat la Predict.")
 
     st.subheader("1) Încarcă un fișier (jpg/png/pdf/xls/xlsx/csv)")
-    # IMPORTANT: single file + fără drag&drop (ascuns prin CSS de mai sus)
     up = st.file_uploader(
         label="Alege fișier",
         type=["png","jpg","jpeg","pdf","xls","xlsx","csv"],
@@ -282,7 +286,6 @@ def main():
     ocr_debug: List[Tuple[str,str]] = []
     auto_inserts = 0
 
-    # afișare clară că am primit fișierul
     if up is not None:
         st.markdown("**Fișier primit:**")
         st.table(pd.DataFrame([{"fisier": up.name, "dimensiune_B": len(up.getbuffer())}]))
@@ -302,7 +305,7 @@ def main():
         except Exception:
             return fallback.isoformat()
 
-    # Buton explicit: „Procesează fișier”
+    # procesează DOAR la apăsarea butonului
     if up is not None and st.button("Procesează fișier"):
         month_dir = UPLOAD_DIR / f"{sel_year}-{str(sel_month).zfill(2)}"
         status_row = {"fisier": up.name, "tip": "", "rows_saved": 0, "mesaj": ""}
@@ -320,7 +323,7 @@ def main():
             elif ext == ".pdf":
                 text = try_ocr_pdf(up.getbuffer())
 
-            # Predict: extrage șofer/tură/mașină + pachete
+            # Predict din text
             if text:
                 ocr_debug.append((up.name, (text[:4000] if text else "")))
                 stops = parse_stops_geplante(text)
@@ -335,7 +338,7 @@ def main():
                     status_row.update({"tip":"PREDICT","rows_saved":0,
                                        "mesaj":f"ctx({drv or 'AUTO'}/{rte or 'AUTO'}/{veh or 'AUTO'}), stops={stops or ''}"})
 
-            # EXCEL/CSV
+            # Excel/CSV
             if ext in [".xlsx",".xls",".csv"]:
                 try:
                     if ext == ".csv":
