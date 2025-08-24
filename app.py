@@ -142,16 +142,15 @@ def try_ocr_pdf(pdf_bytes: bytes) -> Optional[str]:
     except Exception:
         return None
 
-def parse_stops_geplante(text: str) -> Optional[int]:
-    if not text: return None
-    t = normalize_text(text)
-    m = re.search(r"geplante\s+zustellpaket(?:e|te)?\s*[:\-]?\s*([0-9]+)", t)
-    if m:
-        try: return int(m.group(1))
-        except: return None
-    return None
-
 def parse_driver(text: str) -> Optional[str]:
-    if not text: return None
+    if not text:
+        return None
+    t = normalize_text(text)
+    # caută cuvinte precum "Fahrer: Ion" sau "Driver - Gheorghe"
+    pattern = r"(fahrer|driver|sofer)\s*[:\-]?\s*([a-z0-9 ._-]{2,})"
+    m = re.search(pattern, t)
+    if m:
+        return m.group(2).strip().title()[:50]
+    return None
     t = normalize_text(text)
     m = re.search(r"(fahrer|driver|sofer)\s*[:\-]?\s*([a-z0-
