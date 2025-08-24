@@ -246,18 +246,10 @@ def main():
     # CSS: păstrează butonul „Alege fișier”, ascunde chenarul & textul de drag&drop
     st.markdown("""
     <style>
-    [data-testid="stFileUploaderDropzone"] {
-      border: none !important;
-      background: transparent !important;
-      padding: 0 !important;
-    }
-    [data-testid="stFileUploader"] [data-testid="stFileUploaderInstructions"],
-    [data-testid="stFileUploader"] .uploadFile {
-      display: none !important;
-    }
-    [data-testid="stFileUploader"] div[role="button"] {
-      margin: 0.25rem 0 0 0;
-    }
+    [data-testid="stFileUploaderDropzone"] { border:none !important; background:transparent !important; padding:0 !important; }
+    [data-testid="stFileUploader"] [data-testid="stFileUploaderInstructions"], 
+    [data-testid="stFileUploader"] .uploadFile { display:none !important; }
+    [data-testid="stFileUploader"] div[role="button"] { margin: 0.25rem 0 0 0; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -286,70 +278,67 @@ def main():
     ocr_debug: List[Tuple[str,str]] = []
     auto_inserts = 0
 
-    if up is not None:
+    # dacă nu s-a ales nimic, nu facem nimic
+    if up is None:
+        st.caption("Alege un fișier și va fi procesat automat.")
+    else:
+        # citim conținutul o singură dată și îl refolosim peste tot
+        file_name = up.name
+        ext = Path(file_name).suffix.lower()
+        raw_bytes = up.getvalue()
+        file_size = len(raw_bytes)
+
         st.markdown("**Fișier primit:**")
-        st.table(pd.DataFrame([{"fisier": up.name, "dimensiune_B": len(up.getbuffer())}]))
+        st.table(pd.DataFrame([{"fisier": file_name, "extensie": ext, "dimensiune_B": file_size}]))
 
-    def save_file_and_get_path(up_file, subdir: Path) -> Path:
-        subdir.mkdir(parents=True, exist_ok=True)
-        ext = Path(up_file.name).suffix.lower()
-        unique = f"{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
-        out = subdir / unique
-        with open(out, "wb") as f:
-            f.write(up_file.getbuffer())
-        return out
-
-    def ensure_iso_date(val, fallback: dt.date) -> str:
-        try:
-            return pd.to_datetime(val).date().isoformat()
-        except Exception:
-            return fallback.isoformat()
-
-    # procesează DOAR la apăsarea butonului
-    if up is not None and st.button("Procesează fișier"):
+        # salvăm fizic copia fișierului
         month_dir = UPLOAD_DIR / f"{sel_year}-{str(sel_month).zfill(2)}"
-        status_row = {"fisier": up.name, "tip": "", "rows_saved": 0, "mesaj": ""}
+        month_dir.mkdir(parents=True, exist_ok=True)
+        unique = f"{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+        saved_path = month_dir / unique
+        with open(saved_path, "wb") as f:
+            f.write(raw_bytes)
 
+        status_row = {"fisier": file_name, "tip": "", "rows_saved": 0, "mesaj": ""}
+        detected_type = ""
+        added_rows = 0
+        text = None
+
+        # OCR pentru imagine/PDF
         try:
-            path = save_file_and_get_path(up, month_dir)
-            ext = path.suffix.lower()
-            text = None
-            detected_type = ""
-            added_rows = 0
-
-            # OCR dacă e imagine/PDF
             if ext in [".png",".jpg",".jpeg"]:
-                text = try_ocr_image(up.getbuffer())
+                text = try_ocr_image(raw_bytes)
             elif ext == ".pdf":
-                text = try_ocr_pdf(up.getbuffer())
+                text = try_ocr_pdf(raw_bytes)
+        except Exception as e:
+            status_row.update({"tip":"ERROR","mesaj":f"OCR error: {e}"})
 
-            # Predict din text
-            if text:
-                ocr_debug.append((up.name, (text[:4000] if text else "")))
-                stops = parse_stops_geplante(text)
-                drv = parse_driver(text)
-                rte = parse_route(text)
-                veh = parse_vehicle(text)
-                date_iso = default_date.isoformat()
+        if text:
+            ocr_debug.append((file_name, text[:4000]))
+            stops = parse_stops_geplante(text)
+            drv = parse_driver(text)
+            rte = parse_route(text)
+            veh = parse_vehicle(text)
+            date_iso = default_date.isoformat()
 
-                if any([stops is not None, drv, rte, veh]):
-                    upsert_predict_context(date_iso, drv, rte, veh, stops, text)
-                    detected_type = "PREDICT"
-                    status_row.update({"tip":"PREDICT","rows_saved":0,
-                                       "mesaj":f"ctx({drv or 'AUTO'}/{rte or 'AUTO'}/{veh or 'AUTO'}), stops={stops or ''}"})
+            if any([stops is not None, drv, rte, veh]):
+                upsert_predict_context(date_iso, drv, rte, veh, stops, text)
+                detected_type = "PREDICT"
+                status_row.update({"tip":"PREDICT","mesaj":f"ctx({drv or 'AUTO'}/{rte or 'AUTO'}/{veh or 'AUTO'}), stops={stops or ''}"})
 
-            # Excel/CSV
-            if ext in [".xlsx",".xls",".csv"]:
-                try:
-                    if ext == ".csv":
-                        df_x = pd.read_csv(io.BytesIO(up.getbuffer()))
-                    else:
-                        df_x = pd.read_excel(io.BytesIO(up.getbuffer()))  # openpyxl
-                except Exception as e:
-                    status_row.update({"tip":"ERROR","mesaj":f"Eroare citire Excel/CSV: {e}"})
-                    processed_summary.append(status_row)
-                    raise e
+        # Excel/CSV
+        if ext in [".xlsx",".xls",".csv"]:
+            try:
+                if ext == ".csv":
+                    df_x = pd.read_csv(io.BytesIO(raw_bytes))
+                else:
+                    df_x = pd.read_excel(io.BytesIO(raw_bytes))  # openpyxl
+            except Exception as e:
+                status_row.update({"tip":"ERROR","mesaj":f"Eroare citire Excel/CSV: {e}"})
+                processed_summary.append(status_row)
+                df_x = None
 
+            if df_x is not None:
                 cols = [c.strip().lower() for c in df_x.columns]
                 df_x.columns = cols
 
@@ -359,7 +348,6 @@ def main():
                 if is_fuel:
                     detected_type = "FUEL_EXCEL"
                     dcol = "date" if "date" in cols else None
-
                     for _, r in df_x.iterrows():
                         liters = None
                         if "menge" in r and pd.notnull(r["menge"]):
@@ -372,7 +360,10 @@ def main():
                             continue
 
                         if dcol:
-                            date_iso = ensure_iso_date(r[dcol], default_date - dt.timedelta(days=1))
+                            try:
+                                date_iso = pd.to_datetime(r[dcol]).date().isoformat()
+                            except Exception:
+                                date_iso = (default_date - dt.timedelta(days=1)).isoformat()
                         else:
                             date_iso = (default_date - dt.timedelta(days=1)).isoformat()
 
@@ -386,7 +377,7 @@ def main():
                             "hours": float(r.get("hours", 0) or 0),
                             "revenue": float(r.get("revenue", 0) or 0),
                             "stops": int(r.get("stops", 0) or ctx.get("stops",0) or 0),
-                            "notes": f"Fuel Excel {up.name}"
+                            "notes": f"Fuel Excel {file_name}"
                         }
                         insert_entry(row)
                         auto_inserts += 1
@@ -399,7 +390,10 @@ def main():
                         try: return float(str(x).replace(",",".")) if pd.notnull(x) else 0.0
                         except: return 0.0
                     for _, r in df_x.iterrows():
-                        date_iso = ensure_iso_date(r.get("date",""), default_date)
+                        try:
+                            date_iso = pd.to_datetime(r.get("date","")).date().isoformat()
+                        except Exception:
+                            date_iso = default_date.isoformat()
                         fuel_l = to_float(r.get("fuel_l", 0))
                         row = {
                             "date": date_iso,
@@ -419,43 +413,40 @@ def main():
                         added_rows += 1
                     status_row.update({"tip":"RUNS_EXCEL","rows_saved":added_rows})
                 else:
-                    detected_type = "UNKNOWN_EXCEL"
-                    status_row.update({"tip":"UNKNOWN_EXCEL","mesaj":"Nu am recunoscut formatul."})
+                    if not detected_type:
+                        detected_type = "UNKNOWN_EXCEL"
+                        status_row.update({"tip":"UNKNOWN_EXCEL","mesaj":"Nu am recunoscut formatul (lipsesc coloane așteptate)."})
 
-            # Imagine/PDF – bon motorină (Menge) dacă nu a fost alt tip
-            if text and detected_type == "":
-                liters = parse_liters(text)
-                if liters is not None and liters > 0:
-                    date_iso = (default_date - dt.timedelta(days=1)).isoformat()
-                    ctx = get_predict_context_for(date_iso) or {"driver":"AUTO","route":"AUTO","vehicle":"AUTO","stops":0}
-                    row = {
-                        "date": date_iso,
-                        "driver": ctx["driver"], "route": ctx["route"], "vehicle": ctx["vehicle"],
-                        "km": 0.0, "fuel_l": float(liters), "fuel_cost": float(liters) * FUEL_PRICE,
-                        "hours": 0.0, "revenue": 0.0, "stops": int(ctx["stops"] or 0),
-                        "notes": f"Fuel OCR {up.name}"
-                    }
-                    insert_entry(row)
-                    auto_inserts += 1
-                    detected_type = "FUEL_OCR"
-                    status_row.update({"tip":"FUEL_OCR","rows_saved":1,
-                                       "mesaj":f"{liters} L -> {row['fuel_cost']:.2f} €"})
+        # Imagine/PDF – bon motorină (Menge) dacă nu a fost alt tip
+        if text and detected_type == "":
+            liters = parse_liters(text)
+            if liters is not None and liters > 0:
+                date_iso = (default_date - dt.timedelta(days=1)).isoformat()
+                ctx = get_predict_context_for(date_iso) or {"driver":"AUTO","route":"AUTO","vehicle":"AUTO","stops":0}
+                row = {
+                    "date": date_iso,
+                    "driver": ctx["driver"], "route": ctx["route"], "vehicle": ctx["vehicle"],
+                    "km": 0.0, "fuel_l": float(liters), "fuel_cost": float(liters) * FUEL_PRICE,
+                    "hours": 0.0, "revenue": 0.0, "stops": int(ctx["stops"] or 0),
+                    "notes": f"Fuel OCR {file_name}"
+                }
+                insert_entry(row)
+                auto_inserts += 1
+                detected_type = "FUEL_OCR"
+                status_row.update({"tip":"FUEL_OCR","rows_saved":1,
+                                   "mesaj":f"{liters} L -> {row['fuel_cost']:.2f} €"})
 
-            if not detected_type:
-                status_row.update({"tip":"NO_DETECTION","mesaj":"Nu am găsit nici Predict, nici Menge."})
-
-        except Exception as e:
-            status_row.update({"tip":"ERROR","mesaj":str(e)})
+        if not detected_type:
+            status_row.update({"tip":"NO_DETECTION","mesaj":"Nu am găsit nici Predict, nici Menge."})
 
         processed_summary.append(status_row)
 
-        # Excel live (nu blochează dacă pică)
+        # Excel live
         try:
             write_master_excel()
         except Exception as e:
             st.warning(f"Nu am putut actualiza master.xlsx: {e}")
 
-        # Feedback
         st.success(f"Procesare finalizată. Inserări automate: {auto_inserts}.")
         st.markdown("### Rezumat procesare")
         st.dataframe(pd.DataFrame(processed_summary), use_container_width=True)
