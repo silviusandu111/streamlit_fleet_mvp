@@ -31,7 +31,6 @@ def get_conn():
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-    # Înregistrări zilnice (adăugăm stops)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS entries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +64,6 @@ def try_ocr_image(image_bytes: bytes) -> Optional[str]:
         return None
 
 def try_ocr_pdf(pdf_bytes: bytes) -> Optional[str]:
-    # extrage text (nu face OCR pe imagini încorporate)
     try:
         import pdfplumber
         text_parts = []
@@ -81,7 +79,6 @@ def try_ocr_pdf(pdf_bytes: bytes) -> Optional[str]:
 NUM = r"([0-9]+(?:[.,][0-9]+)?)"
 
 def normalize_text(s: str) -> str:
-    """lowercase + normalize accents, pentru regex robuste (ä -> a etc.)"""
     if not s:
         return ""
     s = s.lower()
@@ -94,44 +91,33 @@ def parse_km(text: str) -> Optional[float]:
     for pat in [rf"\b{NUM}\s*km\b", rf"km\s*{NUM}\b"]:
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
-            try:
-                return float(m.group(1).replace(",", "."))
-            except:
-                return None
+            try: return float(m.group(1).replace(",", "."))
+            except: return None
     return None
 
 def parse_liters(text: str) -> Optional[float]:
-    """Caută cantitatea de combustibil în litri: 'menge X', 'X l/liter/litri'."""
+    """Caută cantitatea de combustibil în litri: 'menge <numar>' sau '<numar> l/liter/litri'."""
     if not text: return None
     t = normalize_text(text)
-    # menge <numar>
     m = re.search(rf"\bmenge\s+{NUM}\b", t, flags=re.IGNORECASE)
     if m:
-        try:
-            return float(m.group(1).replace(",", "."))
-        except:
-            pass
-    # <numar> l / liter / litri
+        try: return float(m.group(1).replace(",", "."))
+        except: pass
     m = re.search(rf"\b{NUM}\s*(l|liter|litri)\b", t, flags=re.IGNORECASE)
     if m:
-        try:
-            return float(m.group(1).replace(",", "."))
-        except:
-            pass
+        try: return float(m.group(1).replace(",", "."))
+        except: pass
     return None
 
 def parse_geplante_zustellpakette(text: str) -> Optional[int]:
-    """Extrage numărul de pachete din fraza 'Geplante Zustellpakette: N' (cu variații)."""
+    """Extrage numărul de pachete din 'Geplante Zustellpakette: N' (permite variații minore)."""
     if not text: return None
     t = normalize_text(text)
-    # accepțiuni: geplante/ geplannte; zustellpakete/pakette
     pat = r"geplante\s+zustellpaket(?:e|te)?\s*[:\-]?\s*([0-9]+)"
     m = re.search(pat, t, flags=re.IGNORECASE)
     if m:
-        try:
-            return int(m.group(1))
-        except:
-            return None
+        try: return int(m.group(1))
+        except: return None
     return None
 
 # ---- DB ops ----
@@ -167,7 +153,7 @@ with st.sidebar:
     route_filter = st.text_input("Filtru tură (opțional)")
     vehicle_filter = st.text_input("Filtru mașină (opțional)")
     st.markdown("---")
-    st.info("💡 Urcă poze/PDF/Excel/CSV. Aplicația detectează automat **motorină** (Menge) și **Predict** (Geplante Zustellpakette).")
+    st.info("💡 Urcă poze/PDF/Excel/CSV. Detectez automat **Menge** (motorină) și **Geplante Zustellpakette** (Predict).")
 
 # ----------------- 1) Upload & Autodetect -----------------
 st.subheader("1) Încarcă fișiere (jpg/png/pdf/xls/xlsx/csv)")
@@ -178,9 +164,10 @@ uploads = st.file_uploader(
     accept_multiple_files=True
 )
 
-# lista cu detecții care necesită completare/confirmare înainte de salvare
 detected_rows: List[dict] = []
 excel_frames: List[pd.DataFrame] = []
+uploaded_summary = []
+ocr_debug_dump = []
 
 def mk_base_row(date_val: dt.date) -> dict:
     return {
@@ -204,9 +191,19 @@ if uploads:
     for up in uploads:
         content = up.getbuffer()
         ext = Path(up.name).suffix.lower()
-        text = None
 
-        # OCR pentru imagini / text din PDF
+        # 1) Salvăm fizic
+        unique = f"{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+        out_path = month_dir / unique
+        with open(out_path, "wb") as f:
+            f.write(content)
+
+        text = None
+        liters = None
+        stops_val = None
+        excel_rows = 0
+
+        # 2) Autodetect & OCR
         if ext in [".png", ".jpg", ".jpeg"]:
             text = try_ocr_image(bytes(content))
         elif ext == ".pdf":
@@ -215,38 +212,61 @@ if uploads:
             try:
                 df_x = pd.read_excel(io.BytesIO(bytes(content)))
                 excel_frames.append(df_x)
+                excel_rows = len(df_x)
             except Exception as e:
                 st.error(f"Nu pot citi {up.name} ca Excel: {e}")
         elif ext == ".csv":
             try:
                 df_x = pd.read_csv(io.BytesIO(bytes(content)))
                 excel_frames.append(df_x)
+                excel_rows = len(df_x)
             except Exception as e:
                 st.error(f"Nu pot citi {up.name} ca CSV: {e}")
 
-        # dacă avem text, încercăm să detectăm tipul
         if text:
-            liters = parse_liters(text)            # Motorină (Menge / L)
-            stops_val = parse_geplante_zustellpakette(text)  # Predict: Geplante Zustellpakette
+            ocr_debug_dump.append((up.name, text))
+            liters = parse_liters(text)                      # Motorină
+            stops_val = parse_geplante_zustellpakette(text) # Predict
 
             note_src = f"auto from {up.name}"
-            # Dacă am găsit litri, generăm un rând cu cost calculat
             if liters is not None and liters > 0:
                 r = mk_base_row(default_date)
                 r["fuel_l"] = float(liters)
                 r["fuel_cost"] = float(liters) * FUEL_PRICE
                 r["notes"] = f"Motorină (Menge) – {note_src}"
-                # lăsăm driver/route/vehicle goale pentru a fi completate (sunt NOT NULL => completăm în editor)
                 detected_rows.append(r)
 
-            # Dacă am găsit numărul de pachete din Predict
             if stops_val is not None and stops_val >= 0:
                 r = mk_base_row(default_date)
                 r["stops"] = int(stops_val)
                 r["notes"] = f"Predict (Geplante Zustellpakette) – {note_src}"
                 detected_rows.append(r)
 
-# ----------------- 2) Import Excel/CSV (ture complete) -----------------
+        uploaded_summary.append({
+            "fisier": up.name,
+            "salvat_la": str(out_path.relative_to(DATA_DIR)),
+            "tip": ext.replace(".", "").upper(),
+            "litri_detectati": liters if liters is not None else "",
+            "zustellpakette": stops_val if stops_val is not None else "",
+            "randuri_excel": excel_rows if excel_rows else ""
+        })
+
+# 3) Afișare fișiere încărcate + OCR debug
+if uploaded_summary:
+    st.markdown("#### Fișiere încărcate")
+    st.dataframe(pd.DataFrame(uploaded_summary), use_container_width=True)
+
+    with st.expander("🔍 Text OCR brut (debug)"):
+        if ocr_debug_dump:
+            for name, txt in ocr_debug_dump:
+                st.markdown(f"**{name}**")
+                st.code(txt[:4000] if txt else "(fără text)", language="text")
+        else:
+            st.caption("Nu s-a extras text (doar Excel/CSV sau OCR indisponibil).")
+else:
+    st.caption("Urcă un fișier pentru a-l vedea aici (se salvează în `data/uploads/<an-lună>/`).")
+
+# ----------------- 2) Import din Excel/CSV (ture complete) -----------------
 st.subheader("2) Import din Excel/CSV (ture complete)")
 
 if excel_frames:
@@ -257,7 +277,7 @@ if excel_frames:
     required_cols = ['date','driver','route','vehicle','km','fuel_l','hours','revenue','stops','notes']
     missing = [c for c in required_cols if c not in excel_df.columns]
     if missing:
-        st.warning(f"Lipsesc coloane: {missing}. Antetele așteptate: {required_cols}")
+        st.warning(f"Lipsesc coloane: {missing}. Antete așteptate: {required_cols}")
     else:
         if st.button("📥 Importă rândurile din Excel/CSV în baza de date"):
             def to_float(x):
@@ -293,20 +313,20 @@ if excel_frames:
             conn.commit()
             conn.close()
             st.success(f"Import finalizat: {imported} rânduri.")
+else:
+    st.caption("Încarcă un Excel/CSV pentru import în bloc al turelor.")
 
-# ----------------- 3) Detecții (din poze/PDF) de confirmat și salvat -----------------
+# ----------------- 3) Detecții din poze/PDF – confirmă & salvează -----------------
 st.subheader("3) Detecții din poze/PDF (auto) – completează câmpurile și salvează")
 
 if detected_rows:
     det_df = pd.DataFrame(detected_rows)
-    st.caption("✅ Am detectat rândurile de mai jos. Completează/ajustează **driver / tură / mașină** (obligatoriu).")
+    st.caption("✅ Completează/ajustează **driver / tură / mașină** (obligatoriu) înainte de salvare.")
     edited = st.data_editor(
         det_df,
         use_container_width=True,
         num_rows="dynamic",
-        column_config={
-            "date": st.column_config.DateColumn(format="YYYY-MM-DD")
-        }
+        column_config={"date": st.column_config.DateColumn(format="YYYY-MM-DD")}
     )
 
     colA, colB = st.columns(2)
@@ -319,7 +339,6 @@ if detected_rows:
         if st.button("💾 Save detections în baza de date"):
             saved = 0
             for _, row in edited.iterrows():
-                # completăm câmpuri obligatorii dacă au rămas goale
                 driver = (str(row.get("driver") or "")).strip() or "AUTO"
                 route = (str(row.get("route") or "")).strip() or "AUTO"
                 vehicle = (str(row.get("vehicle") or "")).strip() or "AUTO"
@@ -345,7 +364,7 @@ if detected_rows:
                 st.success(f"Am salvat {saved} rânduri.")
                 st.experimental_rerun()
 else:
-    st.caption("Urcă poze/PDF ca să detectez automat **Menge** (motorină) și **Geplante Zustellpakette** (stopuri).")
+    st.caption("Urcă poze/PDF pentru a detecta **Menge** (motorină) și **Geplante Zustellpakette** (Predict).")
 
 # ----------------- 4) Statistici -----------------
 st.subheader("4) Statistici (zilnic & lunar)")
@@ -365,7 +384,6 @@ else:
         mask &= df["route"].str.contains(route_filter, case=False, na=False)
     if vehicle_filter:
         mask &= df["vehicle"].str.contains(vehicle_filter, case=False, na=False)
-
     fdf = df[mask].copy()
 
     st.markdown("### Zilnic (în luna selectată)")
@@ -373,15 +391,12 @@ else:
         "km":"sum","fuel_l":"sum","fuel_cost":"sum","hours":"sum","revenue":"sum","stops":"sum"
     })
     c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("KM/zi (medie)", f"{daily['km'].mean():.1f}" if not daily.empty else "0.0")
-    with c2:
-        st.metric("Cost motorină/zi (medie)", f"{daily['fuel_cost'].mean():.2f}€" if not daily.empty else "0.00€")
+    with c1: st.metric("KM/zi (medie)", f"{daily['km'].mean():.1f}" if not daily.empty else "0.0")
+    with c2: st.metric("Cost motorină/zi (medie)", f"{daily['fuel_cost'].mean():.2f}€" if not daily.empty else "0.00€")
     with c3:
         profit_series = (daily["revenue"] - daily["fuel_cost"]) if not daily.empty else pd.Series([0])
         st.metric("Profit/zi (medie)", f"{profit_series.mean():.2f}€")
-    with c4:
-        st.metric("Stopuri/zi (medie)", f"{daily['stops'].mean():.0f}" if not daily.empty else "0")
+    with c4: st.metric("Stopuri/zi (medie)", f"{daily['stops'].mean():.0f}" if not daily.empty else "0")
 
     st.dataframe(daily, use_container_width=True)
 
@@ -401,14 +416,13 @@ else:
 
 # ----------------- 5) Export -----------------
 st.subheader("5) Export")
-if not df.empty:
-    filt = df[(pd.to_datetime(df["date"]).dt.month == month) & (pd.to_datetime(df["date"]).dt.year == year)].copy()
+if 'fdf' in locals():
+    filt = fdf.copy()
     csv_bytes = filt.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Descarcă CSV (luna curentă)", data=csv_bytes,
                        file_name=f"export_{year}-{str(month).zfill(2)}.csv", mime="text/csv")
 
     xl = io.BytesIO()
-    # construim câteva agregări utile pentru Excel
     daily_x = filt.groupby("date", as_index=False).agg({"km":"sum","fuel_l":"sum","fuel_cost":"sum","hours":"sum","revenue":"sum","stops":"sum"})
     by_driver_x = filt.groupby("driver", as_index=False).agg({"km":"sum","fuel_l":"sum","fuel_cost":"sum","hours":"sum","revenue":"sum","stops":"sum"})
     by_driver_x["profit"] = by_driver_x["revenue"] - by_driver_x["fuel_cost"]
@@ -428,10 +442,10 @@ if not df.empty:
 st.markdown("---")
 with st.expander("🔧 Ajutor & format fișiere"):
     st.write("""
-    - **Motorină (poze/PDF)**: caut automat *Menge* sau valori în litri -> calculez costul la 1,6 €/L.
-    - **Predict (poze/PDF)**: caut automat *Geplante Zustellpakette* -> extrag numărul exact de pachete/zi.
-    - **Excel/CSV (ture complete)**: folosește antetele:  
-      `date, driver, route, vehicle, km, fuel_l, hours, revenue, stops, notes`  
+    - **Motorină (poze/PDF)**: detectez *Menge* sau cantități în litri și calculez costul la 1,6 €/L.
+    - **Predict (poze/PDF)**: detectez *Geplante Zustellpakette* și extrag numărul exact de pachete/zi.
+    - **Excel/CSV** (ture complete): antete recomandate:
+      `date, driver, route, vehicle, km, fuel_l, hours, revenue, stops, notes`
       (costul motorinei se calculează automat din `fuel_l`).
-    - După detecții, completează **driver/tură/mașină** în tabelul editabil și apasă **Save detections**.
+    - După detecții, completează **driver/tură/mașină** și apasă **Save detections**.
     """)
