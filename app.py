@@ -187,13 +187,13 @@ def parse_liters(text: str) -> Optional[float]:
     if not text:
         return None
     t = normalize_text(text)
-    m = re.search(rf"\bmenge\s+{NUM}\b", t)  # ex: Menge 34,5
+    m = re.search(rf"\bmenge\s+{NUM}\b", t)
     if m:
         try:
             return float(m.group(1).replace(",", "."))
         except:
             pass
-    m = re.search(rf"\b{NUM}\s*(l|liter|litri)\b", t)  # ex: 34 L
+    m = re.search(rf"\b{NUM}\s*(l|liter|litri)\b", t)
     if m:
         try:
             return float(m.group(1).replace(",", "."))
@@ -201,18 +201,17 @@ def parse_liters(text: str) -> Optional[float]:
             pass
     return None
 
-# ================== Header mapping pentru Excel/CSV ==================
+# ================== Header mapping ==================
 HEADER_ALIASES = {
-    # canonical -> posibile antete (normalizate)
-    "date":   ["date", "datum", "data", "tag", "day"],
-    "driver": ["driver", "fahrer", "sofer", "chauffeur", "conducator"],
-    "route":  ["route", "tour", "tura", "tur", "linie"],
-    "vehicle":["vehicle", "vehicul", "fahrzeug", "auto", "masina", "kennzeichen", "nr_inmatriculare"],
-    "km":     ["km", "kilometer", "kilometri", "strecke"],
-    "hours":  ["hours", "ore", "stunden", "zeit"],
-    "revenue":["revenue", "venit", "einnahmen", "umsatz"],
-    "stops":  ["stops", "stopuri", "pakete", "zustellpakete", "geplante_zustellpakette"],
-    "fuel_l": ["fuel_l", "litri", "liter", "l", "menge"],
+    "date":   ["date","datum","data","tag","day","datum_tankung","belegdatum"],
+    "driver": ["driver","fahrer","sofer","chauffeur","conducator"],
+    "route":  ["route","tour","tura","tur","linie"],
+    "vehicle":["vehicle","vehicul","fahrzeug","auto","masina","kennzeichen","nr_inmatriculare","license_plate"],
+    "km":     ["km","kilometer","kilometri","strecke","distanz"],
+    "hours":  ["hours","ore","stunden","zeit","arbeitszeit"],
+    "revenue":["revenue","venit","einnahmen","umsatz"],
+    "stops":  ["stops","stopuri","pakete","zustellpakete","geplante_zustellpakette"],
+    "fuel_l": ["fuel_l","litri","liter","l","menge","menge_ltr","menge_ltr.","tankmenge","betankte_menge"],
 }
 
 def norm(s: str) -> str:
@@ -232,13 +231,12 @@ def map_headers(df: pd.DataFrame) -> pd.DataFrame:
         for c in cols:
             if c in alts:
                 rename[c] = canonical
-        # caz special: 'menge' -> fuel_l dacă nu s-a setat deja
         if canonical == "fuel_l" and "menge" in cols and "fuel_l" not in rename.values():
             rename["menge"] = "fuel_l"
     df = df.rename(columns=rename)
     return df
 
-# ================== Export (live) ==================
+# ================== Export live ==================
 def write_master_excel():
     df = load_entries_df()
     xl = io.BytesIO()
@@ -249,10 +247,8 @@ def write_master_excel():
         with open(MASTER_XLSX, "wb") as f:
             f.write(xl.getvalue())
         return
-
     df2 = df.copy()
     df2["date"] = pd.to_datetime(df2["date"]).dt.date
-
     daily = df2.groupby("date", as_index=False).agg({
         "km":"sum","fuel_l":"sum","fuel_cost":"sum","hours":"sum","revenue":"sum","stops":"sum"
     })
@@ -264,13 +260,11 @@ def write_master_excel():
         "km":"sum","fuel_l":"sum","fuel_cost":"sum","hours":"sum","revenue":"sum","stops":"sum"
     })
     by_route["profit"] = by_route["revenue"] - by_route["fuel_cost"]
-
     with pd.ExcelWriter(xl, engine="xlsxwriter") as writer:
         df2.to_excel(writer, sheet_name="Entries", index=False)
         daily.to_excel(writer, sheet_name="Daily", index=False)
         by_driver.to_excel(writer, sheet_name="ByDriver", index=False)
         by_route.to_excel(writer, sheet_name="ByRoute", index=False)
-
     with open(MASTER_XLSX, "wb") as f:
         f.write(xl.getvalue())
 
@@ -280,7 +274,6 @@ def main():
     st.title(APP_TITLE)
     st.caption("Upload → Auto-detect (Predict & Motorină) → Auto-save → Statistici → Excel live")
 
-    # UI: Filtre
     with st.sidebar:
         st.header("Perioadă & filtre")
         today = dt.date.today()
@@ -291,252 +284,67 @@ def main():
         driver_filter = st.text_input("Filtru șofer")
         route_filter  = st.text_input("Filtru tură")
         vehicle_filter= st.text_input("Filtru mașină")
-        st.info("Bonurile de motorină sunt deseori pentru **ziua precedentă** – le mapez automat la Predict.")
+        st.info("Bonurile de motorină sunt deseori pentru ziua precedentă – le mapez automat la Predict.")
 
-    # Uploader MULTI-fișiere
     st.subheader("1) Încarcă fișiere (jpg/png/pdf/xls/xlsx/csv)")
     uploads = st.file_uploader(
-        "Alege unul sau mai multe fișiere",
+        "Alege fișiere",
         type=["png","jpg","jpeg","pdf","xls","xlsx","csv"],
         accept_multiple_files=True
     )
 
-    processed_summary: List[Dict] = []
-    ocr_debug: List[Tuple[str,str]] = []
     auto_inserts = 0
-
-    # Afișează fișierele primite
     if uploads:
-        rows = [{"fisier": u.name, "extensie": Path(u.name).suffix.lower(), "dimensiune_B": len(u.getvalue())} for u in uploads]
-        st.markdown("**Fișiere primite:**")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-        month_dir = UPLOAD_DIR / f"{sel_year}-{str(sel_month).zfill(2)}"
-        month_dir.mkdir(parents=True, exist_ok=True)
-
         for up in uploads:
-            status_row = {"fisier": up.name, "tip": "", "rows_saved": 0, "mesaj": ""}
-            detected_type = ""
-            added_rows = 0
-
-            try:
-                raw_bytes = up.getvalue()
-                ext = Path(up.name).suffix.lower()
-
-                # Salvează copie
-                unique = f"{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
-                with open(month_dir / unique, "wb") as f:
-                    f.write(raw_bytes)
-
-                # OCR
-                text = None
-                if ext in [".png",".jpg",".jpeg"]:
-                    text = try_ocr_image(raw_bytes)
-                elif ext == ".pdf":
-                    text = try_ocr_pdf(raw_bytes)
-
-                if text:
-                    ocr_debug.append((up.name, text[:4000]))
-                    stops = parse_stops_geplante(text)
-                    drv = parse_driver(text)
-                    rte = parse_route(text)
-                    veh = parse_vehicle(text)
-                    date_iso = default_date.isoformat()
-                    if any([stops is not None, drv, rte, veh]):
-                        upsert_predict_context(date_iso, drv, rte, veh, stops, text)
-                        detected_type = "PREDICT"
-                        status_row.update({"tip":"PREDICT","mesaj":f"ctx({drv or 'AUTO'}/{rte or 'AUTO'}/{veh or 'AUTO'}), stops={stops or ''}"})
-
-                # Excel/CSV
-                if ext in [".xlsx",".xls",".csv"]:
-                    try:
-                        if ext == ".csv":
-                            df_x = pd.read_csv(io.BytesIO(raw_bytes))
-                        else:
-                            df_x = pd.read_excel(io.BytesIO(raw_bytes))  # openpyxl
-                    except Exception as e:
-                        status_row.update({"tip":"ERROR","mesaj":f"Eroare citire Excel/CSV: {e}"})
-                        processed_summary.append(status_row)
-                        continue
-
-                    df_x = map_headers(df_x)
-                    cols = set(df_x.columns)
-
-                    is_fuel = ("fuel_l" in cols) or ("menge" in cols) or ("liter" in cols) or ("l" in cols)
-                    has_run_core = any(c in cols for c in ["driver","route","vehicle","km","stops","hours","revenue"])
-
-                    if is_fuel and not has_run_core:
-                        detected_type = "FUEL_EXCEL"
-                        dcol = "date" if "date" in cols else None
-                        for _, r in df_x.iterrows():
-                            liters = None
-                            for c in ["fuel_l","menge","liter","l"]:
-                                if c in r and pd.notnull(r[c]):
-                                    try:
-                                        liters = float(str(r[c]).replace(",", "."))
-                                        break
-                                    except:
-                                        pass
-                            if liters is None:
-                                continue
-
-                            if dcol and pd.notnull(r.get(dcol, None)):
-                                try:
-                                    date_iso = pd.to_datetime(r[dcol]).date().isoformat()
-                                except Exception:
-                                    date_iso = (default_date - dt.timedelta(days=1)).isoformat()
-                            else:
-                                date_iso = (default_date - dt.timedelta(days=1)).isoformat()
-
-                            ctx = get_predict_context_for(date_iso) or {"driver":"AUTO","route":"AUTO","vehicle":"AUTO","stops":0}
-                            row = {
-                                "date": date_iso,
-                                "driver": ctx["driver"], "route": ctx["route"], "vehicle": ctx["vehicle"],
-                                "km": float(r.get("km", 0) or 0),
-                                "fuel_l": float(liters),
-                                "fuel_cost": float(liters) * FUEL_PRICE,
-                                "hours": float(r.get("hours", 0) or 0),
-                                "revenue": float(r.get("revenue", 0) or 0),
-                                "stops": int(r.get("stops", 0) or ctx.get("stops",0) or 0),
-                                "notes": f"Fuel Excel {up.name}"
-                            }
-                            insert_entry(row)
-                            auto_inserts += 1
-                            added_rows += 1
-                        status_row.update({"tip":"FUEL_EXCEL","rows_saved":added_rows})
-
-                    elif has_run_core:
-                        detected_type = "RUNS_EXCEL"
-                        def to_float(x):
-                            try: return float(str(x).replace(",",".")) if pd.notnull(x) else 0.0
-                            except: return 0.0
-                        for _, r in df_x.iterrows():
-                            try:
-                                date_iso = pd.to_datetime(r.get("date","")).date().isoformat()
-                            except Exception:
-                                date_iso = default_date.isoformat()
-                            fuel_l = 0.0
-                            for c in ["fuel_l","menge","liter","l"]:
-                                if c in r and pd.notnull(r[c]):
-                                    try:
-                                        fuel_l = float(str(r[c]).replace(",", "."))
-                                        break
-                                    except:
-                                        pass
-                            row = {
-                                "date": date_iso,
-                                "driver": str(r.get("driver","AUTO")).strip() or "AUTO",
-                                "route": str(r.get("route","AUTO")).strip() or "AUTO",
-                                "vehicle": str(r.get("vehicle","AUTO")).strip() or "AUTO",
-                                "km": to_float(r.get("km", 0)),
-                                "fuel_l": fuel_l,
-                                "fuel_cost": fuel_l * FUEL_PRICE,
-                                "hours": to_float(r.get("hours", 0)),
-                                "revenue": to_float(r.get("revenue", 0)),
-                                "stops": int(r.get("stops", 0) or 0),
-                                "notes": str(r.get("notes","")).strip()
-                            }
-                            insert_entry(row)
-                            auto_inserts += 1
-                            added_rows += 1
-                        status_row.update({"tip":"RUNS_EXCEL","rows_saved":added_rows})
+            ext = Path(up.name).suffix.lower()
+            raw_bytes = up.getvalue()
+            # Excel/CSV
+            if ext in [".xlsx",".xls",".csv"]:
+                try:
+                    if ext==".csv":
+                        df_x = pd.read_csv(io.BytesIO(raw_bytes))
                     else:
-                        detected_type = "UNKNOWN_EXCEL"
-                        status_row.update({"tip":"UNKNOWN_EXCEL","mesaj":"Nu am recunoscut formatul (lipsesc coloane uzuale)."})
-
-                # Imagine/PDF – bon motorină (Menge) dacă nu a fost alt tip
-                if (ext in [".png",".jpg",".jpeg",".pdf"]) and text and detected_type == "":
-                    liters = parse_liters(text)
-                    if liters is not None and liters > 0:
-                        date_iso = (default_date - dt.timedelta(days=1)).isoformat()
+                        df_x = pd.read_excel(io.BytesIO(raw_bytes))
+                    df_x = map_headers(df_x)
+                    for _,r in df_x.iterrows():
+                        liters = float(str(r.get("fuel_l",0)).replace(",",".") or 0)
+                        if liters==0: continue
+                        date_iso = default_date.isoformat()
                         ctx = get_predict_context_for(date_iso) or {"driver":"AUTO","route":"AUTO","vehicle":"AUTO","stops":0}
                         row = {
                             "date": date_iso,
-                            "driver": ctx["driver"], "route": ctx["route"], "vehicle": ctx["vehicle"],
-                            "km": 0.0, "fuel_l": float(liters), "fuel_cost": float(liters) * FUEL_PRICE,
-                            "hours": 0.0, "revenue": 0.0, "stops": int(ctx["stops"] or 0),
-                            "notes": f"Fuel OCR {up.name}"
+                            "driver": str(r.get("driver",ctx["driver"])),
+                            "route": str(r.get("route",ctx["route"])),
+                            "vehicle": str(r.get("vehicle",ctx["vehicle"])),
+                            "km": float(r.get("km",0) or 0),
+                            "fuel_l": liters,
+                            "fuel_cost": liters*FUEL_PRICE,
+                            "hours": float(r.get("hours",0) or 0),
+                            "revenue": float(r.get("revenue",0) or 0),
+                            "stops": int(r.get("stops",ctx["stops"]) or 0),
+                            "notes": "Excel import"
                         }
                         insert_entry(row)
-                        auto_inserts += 1
-                        detected_type = "FUEL_OCR"
-                        status_row.update({"tip":"FUEL_OCR","rows_saved":1,
-                                           "mesaj":f"{liters} L -> {row['fuel_cost']:.2f} €"})
+                        auto_inserts+=1
+                except Exception as e:
+                    st.error(f"Eroare Excel: {e}")
 
-                if not detected_type:
-                    status_row.update({"tip":"NO_DETECTION","mesaj":"Nu am găsit nici Predict, nici Menge."})
+        write_master_excel()
+        st.success(f"Procesare finalizată, inserări: {auto_inserts}")
 
-            except Exception as e:
-                status_row.update({"tip":"ERROR","mesaj":str(e)})
-
-            processed_summary.append(status_row)
-
-        # Excel live (safe)
-        try:
-            write_master_excel()
-        except Exception as e:
-            st.warning(f"Nu am putut actualiza master.xlsx: {e}")
-
-        st.success(f"Procesare finalizată. Inserări automate: {auto_inserts}.")
-        st.markdown("### Rezumat procesare")
-        st.dataframe(pd.DataFrame(processed_summary), use_container_width=True)
-
-        if ocr_debug:
-            with st.expander("🔍 OCR debug (primele 4000 caractere/fișier)"):
-                for name, txt in ocr_debug:
-                    st.markdown(f"**{name}**")
-                    st.code(txt or "(fără text)", language="text")
-
-    # ===== Statistici + Export =====
-    st.subheader("2) Statistici (zilnic & lunar) + Export live")
+    st.subheader("2) Statistici (zilnic & lunar)")
     df = load_entries_df()
     if df.empty:
         st.warning("Nu există date încă.")
     else:
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        mask = (pd.to_datetime(df["date"]).dt.month == sel_month) & (pd.to_datetime(df["date"]).dt.year == sel_year)
-        if driver_filter:  mask &= df["driver"].str.contains(driver_filter, case=False, na=False)
-        if route_filter:   mask &= df["route"].str.contains(route_filter, case=False, na=False)
-        if vehicle_filter: mask &= df["vehicle"].str.contains(vehicle_filter, case=False, na=False)
-        fdf = df[mask].copy()
+        df["date"]=pd.to_datetime(df["date"]).dt.date
+        mask = (pd.to_datetime(df["date"]).dt.month==sel_month)&(pd.to_datetime(df["date"]).dt.year==sel_year)
+        fdf=df[mask].copy()
+        daily=fdf.groupby("date",as_index=False).agg({"fuel_l":"sum","fuel_cost":"sum","stops":"sum"})
+        by_route=fdf.groupby("route",as_index=False).agg({"fuel_l":"sum","fuel_cost":"sum","stops":"sum"})
+        st.dataframe(daily,use_container_width=True)
+        st.dataframe(by_route,use_container_width=True)
 
-        # Zilnic
-        daily = fdf.groupby("date", as_index=False).agg({
-            "km":"sum","fuel_l":"sum","fuel_cost":"sum","hours":"sum","revenue":"sum","stops":"sum"
-        })
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: st.metric("KM/zi (medie)", f"{daily['km'].mean():.1f}" if not daily.empty else "0.0")
-        with c2: st.metric("Cost motorină/zi (medie)", f"{daily['fuel_cost'].mean():.2f}€" if not daily.empty else "0.00€")
-        with c3:
-            prof = (daily["revenue"] - daily["fuel_cost"]).mean() if not daily.empty else 0.0
-            st.metric("Profit/zi (medie)", f"{prof:.2f}€")
-        with c4: st.metric("Stopuri/zi (medie)", f"{daily['stops'].mean():.0f}" if not daily.empty else "0")
-
-        st.markdown("### ▶ Per tură (litri & cost)")
-        by_route = fdf.groupby("route", as_index=False).agg({
-            "fuel_l":"sum", "fuel_cost":"sum", "km":"sum", "stops":"sum", "revenue":"sum"
-        })
-        by_route["profit"] = by_route["revenue"] - by_route["fuel_cost"]
-        st.dataframe(by_route.sort_values(["fuel_l","fuel_cost"], ascending=False), use_container_width=True)
-
-        st.markdown("### ▶ Per șofer")
-        by_driver = fdf.groupby("driver", as_index=False).agg({
-            "fuel_l":"sum", "fuel_cost":"sum", "km":"sum", "stops":"sum", "revenue":"sum"
-        })
-        by_driver["profit"] = by_driver["revenue"] - by_driver["fuel_cost"]
-        st.dataframe(by_driver.sort_values(["fuel_l","fuel_cost"], ascending=False), use_container_width=True)
-
-        st.markdown("### ▶ Zilnic")
-        st.dataframe(daily.sort_values("date"), use_container_width=True)
-
-        if MASTER_XLSX.exists():
-            with open(MASTER_XLSX, "rb") as f:
-                st.download_button("⬇️ Descarcă Excel live (master.xlsx)", f, file_name="master.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        else:
-            st.caption("Excel live nu a fost generat încă.")
-
-# ---------- Run ----------
-if __name__ == "__main__":
+if __name__=="__main__":
     init_db()
     main()
