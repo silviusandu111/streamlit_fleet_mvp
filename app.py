@@ -2,39 +2,69 @@ import io, re, sqlite3, unicodedata, datetime as dt, calendar
 from pathlib import Path
 import pandas as pd
 import streamlit as st
-from pdfminer.high_level import extract_text  # pentru Tankpool PDF
+from pdfminer_high_level import extract_text as pdf_extract_text  # alias pt. claritate
+from pdfminer.high_level import extract_text  # compat
+import plotly.express as px
+
+# OCR pentru poze (opțional, dacă nu se poate instala -> fallback manual)
+try:
+    import easyocr
+    OCR_READER = easyocr.Reader(['de','en'], gpu=False)
+except Exception:
+    OCR_READER = None
 
 # ================== CONFIG ==================
-APP_TITLE = "SANS – Motorină & Predict (Tankpool)"
+APP_TITLE = "SANS — Motorină & Predict"
 DATA_DIR = Path("data"); UPLOAD_DIR = DATA_DIR / "uploads"; DB_PATH = DATA_DIR / "fleet.db"
 for p in (DATA_DIR, UPLOAD_DIR): p.mkdir(parents=True, exist_ok=True)
 
 VAT_RATE = 0.19
-FUEL_PRICE_GROSS = 1.6  # €/L (cu TVA) pt. Excel
+FUEL_PRICE_GROSS = 1.6  # €/L cu TVA – pentru EXCEL Tankpool când nu avem preț în fișier
 
-# ================== FORMAT (EU) ==================
-def de_thousands(n: float, dec: int = 0) -> str:
+# ================== UI / THEME ==================
+st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="⛽")
+CUSTOM_CSS = """
+<style>
+    .small-muted { opacity: .7; font-size: 0.9rem; }
+    .metric-card { background: #111827; border: 1px solid #1f2937; padding: 12px 16px; border-radius: 14px; }
+    .card      { background: #0b1220; border: 1px solid #162033; padding: 16px; border-radius: 14px; }
+    .section-h { font-weight: 700; font-size: 1.05rem; margin-bottom: 8px; }
+    .stDataFrame { border-radius: 10px; overflow: hidden; }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ================== FORMAT (EU, fără zecimale) ==================
+def de_thousands_int(n: float | int) -> str:
     try: n = float(n)
     except: n = 0.0
-    s = f"{n:,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    s = f"{n:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return s
 
-def de_eur(n: float, dec: int = 2) -> str:
-    return f"{de_thousands(n, dec)} €"
+def de_eur0(n: float | int) -> str:
+    return f"{de_thousands_int(n)} €"
 
 # ================== DB ==================
 @st.cache_resource
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys=ON;"); migrate(conn); init_counters(conn); return conn
+    conn.execute("PRAGMA foreign_keys=ON;")
+    migrate(conn); init_counters(conn)
+    return conn
 
 def migrate(conn):
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS entries(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL, driver TEXT, route TEXT, vehicle TEXT,
-        fuel_l REAL DEFAULT 0, fuel_cost_net REAL DEFAULT 0, fuel_cost_gross REAL DEFAULT 0,
-        stops INTEGER DEFAULT 0, packages INTEGER DEFAULT 0, notes TEXT );""")
+        date TEXT NOT NULL,
+        driver TEXT, route TEXT, vehicle TEXT,
+        fuel_l REAL DEFAULT 0,
+        fuel_cost_net REAL DEFAULT 0,
+        fuel_cost_gross REAL DEFAULT 0,
+        stops INTEGER DEFAULT 0,
+        packages INTEGER DEFAULT 0,
+        notes TEXT
+    );""")
     c.execute("PRAGMA table_info(entries);")
     have = {r[1] for r in c.fetchall()}
     if "fuel_cost_net" not in have:   c.execute("ALTER TABLE entries ADD COLUMN fuel_cost_net REAL DEFAULT 0;")
@@ -43,16 +73,19 @@ def migrate(conn):
 
 def init_counters(conn):
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, since TEXT NOT NULL);""")
+    c.execute("""CREATE TABLE IF NOT EXISTS counters(
+        name TEXT PRIMARY KEY, since TEXT NOT NULL
+    );""")
     for name in ("fuel","packages"):
         c.execute("INSERT OR IGNORE INTO counters(name,since) VALUES(?,?)",(name,"2000-01-01"))
     conn.commit()
 
 def hard_reset_db():
     if DB_PATH.exists(): DB_PATH.unlink()
-    st.cache_resource.clear(); st.toast("DB ștearsă. Dă refresh.", icon="⚠️")
+    st.cache_resource.clear()
+    st.toast("Baza de date a fost ștearsă. Reîncarcă pagina (Ctrl+R).", icon="⚠️")
 
-def get_counter_since(conn, name): 
+def get_counter_since(conn, name):
     c = conn.cursor(); c.execute("SELECT since FROM counters WHERE name=?", (name,))
     row = c.fetchone(); return dt.date.fromisoformat(row[0]) if row else dt.date(2000,1,1)
 
@@ -70,46 +103,28 @@ def load_entries_df(conn)->pd.DataFrame:
     if not df.empty: df["date"] = pd.to_datetime(df["date"]).dt.date
     return df
 
-# ================== HELPERS ==================
+# ================== HELPERI ==================
 def month_last_day(d: dt.date) -> int: return calendar.monthrange(d.year, d.month)[1]
 
-# --- Detect & parse Tankmenge corect pentru toată coloana ---
 def parse_liters_series(series: pd.Series) -> pd.Series:
+    """Convertă consistent în L chiar dacă fișierul folosește , sau . pentru zecimale."""
     s = series.astype(str).str.strip().str.replace("\u00a0","", regex=False)
-
-    # statistici simple
-    has_comma = s.str.contains(",").mean() > 0.5
-    has_dot   = s.str.contains(r"\.").mean() > 0.5
-
-    def _to_float(val: str) -> float:
-        if val == "" or val.lower() == "nan": return 0.0
-        v = val
-        # Reguli:
-        # 1) Doar virgule => virgula este zecimal
-        # 2) Doar puncte: dacă toate valorile < 300 => punct zecimal, altfel punct mii
-        # 3) Ambele semne => format german: . mii, , zecimal
+    def _to_float(v: str) -> float:
+        if v == "" or v.lower()=="nan": return 0.0
         if "," in v and "." not in v:
-            v = v.replace(",", ".")
+            v = v.replace(",", ".")                  # 12,7 -> 12.7
         elif "." in v and "," not in v:
-            # decidem pe baza formei locale a valorii
-            # dacă are exact 3 cifre după ., îl considerăm zecimal (gen 9.626)
             m = re.search(r"\.(\d+)$", v)
-            if m and 1 <= len(m.group(1)) <= 3:
-                pass  # '.' zecimal
-            else:
-                v = v.replace(".", "")  # '.' mii
+            if not (m and 1 <= len(m.group(1)) <= 3):
+                v = v.replace(".", "")               # 12.345 -> 12345
         else:
-            # ambele semne -> german
-            v = v.replace(".", "").replace(",", ".")
-        try:
-            return float(v)
-        except:
-            return 0.0
-
+            v = v.replace(".", "").replace(",", ".") # 12.345,67
+        try: return float(v)
+        except: return 0.0
     return s.apply(_to_float)
 
-# ================== Tankpool PDF ==================
-PDF_LINE = re.compile(
+# ================== PARSERE TANKPOOL ==================
+PDF_TANKPOOL_RX = re.compile(
     r"(?P<date>\d{2}\.\d{2}\.\d{2})\s+\d{2}:\d{2}\s+\d+\s+[A-Za-zÄÖÜäöüß.\- ]+\s+"
     r"(?P<prod>Diesel|AdBlue)\s+(?P<liters>[\d.,]+)\s+L\s+(?P<unit_net>[\d.,]+)\s+(?P<sum_net>[\d.,]+)",
     re.IGNORECASE
@@ -118,7 +133,7 @@ PDF_LINE = re.compile(
 def parse_tankpool_pdf(content: bytes) -> pd.DataFrame:
     text = extract_text(io.BytesIO(content)) or ""
     rows=[]
-    for m in PDF_LINE.finditer(text):
+    for m in PDF_TANKPOOL_RX.finditer(text):
         if m.group("prod").lower()!="diesel": continue
         liters = parse_liters_series(pd.Series([m.group("liters")]))[0]
         unit   = parse_liters_series(pd.Series([m.group("unit_net")]))[0]
@@ -133,7 +148,46 @@ def parse_tankpool_pdf(content: bytes) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-# ================== SIDEBAR ==================
+# ================== PREDICT (JPG/PDF) — doar PACHETE TOTALE ==================
+PREDICT_HINTS = ("zustellpaket", "geplante zustell", "pakete", "tour", "fahrer", "systempartner")
+DATE_RX = re.compile(r"(\d{2}\.\d{2}\.\d{4})")
+
+def ocr_image_to_text(b: bytes) -> str:
+    if not OCR_READER:
+        return ""
+    try:
+        import numpy as np
+        from PIL import Image
+        img = Image.open(io.BytesIO(b)).convert("RGB")
+        arr = np.array(img)
+        lines = OCR_READER.readtext(arr, detail=0, paragraph=True)
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+def extract_packages_total(text: str) -> int:
+    """
+    Caută valori după 'Geplante Zustell...' sau 'Pakete' și le însumează.
+    Dacă OCR nu e perfect, iau toate numerele de 2-4 cifre de pe linia/coloana respectivă.
+    """
+    if not text: return 0
+    t = unicodedata.normalize("NFKD", text)
+    total = 0
+    # rule 1: linii care conțin 'geplante' + 'paket'
+    for line in t.splitlines():
+        low = line.lower()
+        if "geplante" in low and "paket" in low:
+            nums = [int(n) for n in re.findall(r"\b\d{2,4}\b", line)]
+            total += sum(nums)
+    if total > 0:
+        return total
+    # rule 2: fallback – toate numerele mari (≥50) din text (tabele OCR)
+    nums = [int(n) for n in re.findall(r"\b\d{2,4}\b", t)]
+    # Fără rubrici de ETA (%) etc. — luăm doar între 50 și 5000 ca pachete
+    nums = [x for x in nums if 50 <= x <= 5000]
+    return sum(nums)
+
+# ================== SIDEBAR SUMMARY ==================
 def sidebar_summary(conn, key_suffix: str):
     df = load_entries_df(conn)
     fuel_since = get_counter_since(conn, "fuel"); pkg_since = get_counter_since(conn, "packages")
@@ -144,12 +198,20 @@ def sidebar_summary(conn, key_suffix: str):
         net_sum = df[df["date"]>=fuel_since]["fuel_cost_net"].sum()
         gross_sum = df[df["date"]>=fuel_since]["fuel_cost_gross"].sum()
         pk_sum  = int(df[df["date"]>=pkg_since]["packages"].sum())
-    st.markdown("### Sumar live")
-    st.markdown(f"**⛽ Motorină acumulată:** {de_thousands(l_sum,3)} L • {de_eur(gross_sum,2)}  \n_net: {de_eur(net_sum,2)}_")
-    st.markdown(f"**📦 Pachete acumulate:** {de_thousands(pk_sum,0)}")
+
+    st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+    st.markdown(f"**⛽ Motorină acumulată:** {de_thousands_int(l_sum)} L • {de_eur0(gross_sum)}  \n"
+                f"<span class='small-muted'>net: {de_eur0(net_sum)}</span>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="metric-card" style="margin-top:10px;">', unsafe_allow_html=True)
+    st.markdown(f"**📦 Pachete acumulate:** {de_thousands_int(pk_sum)}", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
     today = dt.date.today(); last_day = month_last_day(today)
     if today.day in (16, last_day): st.warning("⚠️ Resetează **motorina** (Tankpool).")
     if today.day in (15, last_day): st.warning("⚠️ Resetează **pachetele**.")
+
     with st.expander("Administrare"):
         c1,c2,c3 = st.columns(3)
         if c1.button("Reset motorină", key=f"rf_{key_suffix}"):
@@ -161,48 +223,90 @@ def sidebar_summary(conn, key_suffix: str):
 
 # ================== APP ==================
 def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
+    st.title("SANS — Motorină (Tankpool) & Predict (pachete)")
     conn = get_conn()
 
     with st.sidebar: sidebar_summary(conn, "top")
 
-    st.subheader("1) Încarcă fișiere (Tankpool: Excel/PDF)")
-    uploads = st.file_uploader("Selectează fișiere (poți mai multe). Pentru costuri corecte, PDF Tankpool ideal.",
-                               type=["xls","xlsx","csv","pdf"], accept_multiple_files=True)
+    with st.container():
+        st.markdown('<div class="card"><div class="section-h">1) Încarcă fișiere</div>', unsafe_allow_html=True)
+        default_predict_date = st.date_input("Dată implicită pentru Predict (dacă nu se găsește în document)", dt.date.today())
+        uploads = st.file_uploader(
+            "Selectează fișiere Tankpool (Excel/PDF) sau Predict (PDF/JPG/PNG). Poți încărca mai multe odată.",
+            type=["xls","xlsx","csv","pdf","png","jpg","jpeg"], accept_multiple_files=True
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
 
     results=[]
     if uploads:
-        today = dt.date.today()
         for up in uploads:
             name, ext = up.name, Path(up.name).suffix.lower()
             raw = up.getvalue()
 
-            if ext==".pdf":
-                dfp = parse_tankpool_pdf(raw); ins=0
-                for _,r in dfp.iterrows():
-                    delivery = r["date"] + dt.timedelta(days=1)
+            # ---- PDF: detect Tankpool vs Predict după conținut
+            if ext == ".pdf":
+                text = extract_text(io.BytesIO(raw)) or ""
+                if re.search(r"Diesel\s+[\d.,]+\s+L", text, re.IGNORECASE):
+                    # Tankpool PDF -> litri + cost NET/BRUT
+                    dfp = parse_tankpool_pdf(raw); ins=0
+                    for _,r in dfp.iterrows():
+                        delivery = r["date"] + dt.timedelta(days=1)
+                        insert_entry(conn, {
+                            "date": delivery.isoformat(), "driver":"AUTO", "route":"AUTO", "vehicle": "AUTO",
+                            "fuel_l": float(r["fuel_l"]), "fuel_cost_net": float(r["fuel_cost_net"]),
+                            "fuel_cost_gross": float(r["fuel_cost_gross"]), "stops":0, "packages":0, "notes":"Tankpool PDF"
+                        }); ins+=1
+                    results.append({"fișier":name,"tip":"TANKPOOL_PDF","rows":ins,"mesaj":"OK"})
+                else:
+                    # Predict PDF -> doar total pachete (pe zi)
+                    total_pk = extract_packages_total(text)
+                    date = DATE_RX.search(text)
+                    d = pd.to_datetime(date.group(1), dayfirst=True, errors="coerce").date() if date else default_predict_date
                     insert_entry(conn, {
-                        "date": delivery.isoformat(), "driver":"AUTO", "route":"AUTO", "vehicle": r.get("vehicle","AUTO"),
-                        "fuel_l": float(r["fuel_l"]), "fuel_cost_net": float(r["fuel_cost_net"]),
-                        "fuel_cost_gross": float(r["fuel_cost_gross"]), "stops":0, "packages":0, "notes": r.get("notes","Tankpool PDF")
-                    }); ins+=1
-                results.append({"fișier":name,"tip":"TANKPOOL_PDF","rows":ins,"mesaj":"OK"}); continue
+                        "date": d.isoformat(), "driver":"AUTO", "route":"PREDICT", "vehicle":"AUTO",
+                        "fuel_l":0, "fuel_cost_net":0, "fuel_cost_gross":0,
+                        "stops":0, "packages": int(total_pk), "notes":"Predict PDF (total pachete)"
+                    })
+                    results.append({"fișier":name,"tip":"PREDICT_PDF","rows":1,"mesaj":f"pachete={int(total_pk)}"})
+                continue
 
+            # ---- IMG = Predict (OCR) -> doar total pachete
+            if ext in (".png",".jpg",".jpeg"):
+                txt = ocr_image_to_text(raw)
+                total_pk = extract_packages_total(txt) if txt else 0
+                if total_pk == 0:
+                    with st.expander(f"Nu am putut citi pachetele din {name} – completează manual totalul:"):
+                        d = st.date_input("Data", value=default_predict_date, key=f"d_{name}")
+                        p = st.number_input("Total pachete", 0, step=1, key=f"p_{name}")
+                        if st.button("Salvează", key=f"b_{name}"):
+                            insert_entry(conn, {
+                                "date": d.isoformat(), "driver":"AUTO", "route":"PREDICT", "vehicle":"AUTO",
+                                "fuel_l":0, "fuel_cost_net":0, "fuel_cost_gross":0,
+                                "stops":0, "packages": int(p), "notes":"Predict manual (IMG)"
+                            }); st.success("Predict salvat.")
+                    results.append({"fișier":name,"tip":"PREDICT_IMG","rows":0,"mesaj":"OCR n/a"})
+                else:
+                    insert_entry(conn, {
+                        "date": default_predict_date.isoformat(), "driver":"AUTO", "route":"PREDICT", "vehicle":"AUTO",
+                        "fuel_l":0, "fuel_cost_net":0, "fuel_cost_gross":0,
+                        "stops":0, "packages": int(total_pk), "notes":"Predict IMG OCR (total pachete)"
+                    })
+                    results.append({"fișier":name,"tip":"PREDICT_IMG","rows":1,"mesaj":f"pachete={int(total_pk)}"})
+                continue
+
+            # ---- Excel/CSV = Tankpool
             if ext in (".xls",".xlsx",".csv"):
-                # citește ca STRING ca să nu lase Excel să-și impună formatul
                 df_x = (pd.read_excel(io.BytesIO(raw), dtype=str)
                         if ext != ".csv" else pd.read_csv(io.BytesIO(raw), dtype=str, sep=None, engine="python"))
-                # Aștept: 'Datum', 'Tankmenge', 'Kennzeichen' (variază, dar astea sunt uzuale)
+                # antete tipice: Datum | Tankmenge | Kennzeichen (oraș/mașină)
                 if "Tankmenge" not in df_x.columns:
-                    # încearcă câteva alias-uri
                     for alt in ["Menge","Liter","Betankte Menge","Tankmenge [l]"]:
                         if alt in df_x.columns: df_x.rename(columns={alt:"Tankmenge"}, inplace=True)
                 if "Datum" not in df_x.columns:
                     for alt in ["Date","Belegdatum","Tankdatum","Datum Tankung"]:
                         if alt in df_x.columns: df_x.rename(columns={alt:"Datum"}, inplace=True)
                 if "Kennzeichen" not in df_x.columns:
-                    for alt in ["Fahrzeug","Kennz","Kennz."]:
+                    for alt in ["Fahrzeug","Kennz","Kennz.","Ort","Route"]:
                         if alt in df_x.columns: df_x.rename(columns={alt:"Kennzeichen"}, inplace=True)
 
                 if "Tankmenge" not in df_x.columns or "Datum" not in df_x.columns:
@@ -215,15 +319,15 @@ def main():
                     liters = float(liters_series.iloc[idx])
                     if liters<=0: continue
                     try: refuel = pd.to_datetime(row.get("Datum"), dayfirst=True, errors="coerce").date()
-                    except: refuel = today
+                    except: refuel = dt.date.today()
                     delivery = refuel + dt.timedelta(days=1)
-                    veh = str(row.get("Kennzeichen","AUTO")).upper()
+                    route = str(row.get("Kennzeichen","AUTO")).strip() or "AUTO"
 
                     gross = liters * FUEL_PRICE_GROSS
                     net   = gross / (1+VAT_RATE)
 
                     insert_entry(conn, {
-                        "date": delivery.isoformat(), "driver":"AUTO", "route": veh, "vehicle": veh,
+                        "date": delivery.isoformat(), "driver":"AUTO", "route": route, "vehicle": route,
                         "fuel_l": liters, "fuel_cost_net": net, "fuel_cost_gross": gross,
                         "stops":0, "packages":0, "notes":"Tankpool Excel"
                     }); ins+=1
@@ -234,33 +338,58 @@ def main():
             st.dataframe(pd.DataFrame(results), use_container_width=True)
         with st.sidebar: st.divider(); sidebar_summary(conn, "after")
 
-    # 2) Statistici
-    st.subheader("2) Statistici")
-    df = load_entries_df(conn)
-    if df.empty: st.info("Nu există date încă."); return
+    # ================== STATISTICI + CHART ==================
+    df = load_entries_df(get_conn())
+    st.markdown('<div class="card"><div class="section-h">2) Statistici (zilnic & pe tură)</div>', unsafe_allow_html=True)
+    if df.empty:
+        st.info("Nu există date încă.")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
 
+    # Pe zi (afișare fără zecimale)
     daily = df.groupby("date", as_index=False).agg({
         "fuel_l":"sum","fuel_cost_net":"sum","fuel_cost_gross":"sum","stops":"sum","packages":"sum"
     }).sort_values("date")
     daily_fmt = daily.copy()
-    daily_fmt["fuel_l"] = daily_fmt["fuel_l"].apply(lambda x: de_thousands(x,3))
-    daily_fmt["fuel_cost_net"] = daily_fmt["fuel_cost_net"].apply(lambda x: de_eur(x,2))
-    daily_fmt["fuel_cost_gross"] = daily_fmt["fuel_cost_gross"].apply(lambda x: de_eur(x,2))
-    st.markdown("### ▶ Pe zi (litri, cost net/brut, stopuri, pachete)")
-    st.dataframe(daily_fmt.rename(columns={"fuel_l":"litri","fuel_cost_net":"cost (net)","fuel_cost_gross":"cost (brut)"}),
-                 use_container_width=True)
+    daily_fmt["fuel_l"]          = daily_fmt["fuel_l"].apply(de_thousands_int)
+    daily_fmt["fuel_cost_net"]   = daily_fmt["fuel_cost_net"].apply(de_eur0)
+    daily_fmt["fuel_cost_gross"] = daily_fmt["fuel_cost_gross"].apply(de_eur0)
+    st.markdown("**▶ Pe zi (litri, cost net/brut, pachete)**")
+    st.dataframe(daily_fmt.rename(columns={
+        "fuel_l":"litri","fuel_cost_net":"cost (net)","fuel_cost_gross":"cost (brut)"
+    }), use_container_width=True)
 
+    # Pe tură / oraș
     by_route = df.groupby("route", as_index=False).agg({
         "fuel_l":"sum","fuel_cost_net":"sum","fuel_cost_gross":"sum","stops":"sum","packages":"sum"
     }).sort_values(["fuel_l","fuel_cost_gross"], ascending=False)
-    br_fmt = by_route.copy()
-    br_fmt["fuel_l"] = br_fmt["fuel_l"].apply(lambda x: de_thousands(x,3))
-    br_fmt["fuel_cost_net"] = br_fmt["fuel_cost_net"].apply(lambda x: de_eur(x,2))
-    br_fmt["fuel_cost_gross"] = br_fmt["fuel_cost_gross"].apply(lambda x: de_eur(x,2))
-    st.markdown("### ▶ Pe tură (litri, cost net/brut, stopuri, pachete)")
-    st.dataframe(br_fmt.rename(columns={"route":"tură","fuel_l":"litri","fuel_cost_net":"cost (net)","fuel_cost_gross":"cost (brut)"}),
-                 use_container_width=True)
+    by_route_fmt = by_route.copy()
+    by_route_fmt["fuel_l"]          = by_route_fmt["fuel_l"].apply(de_thousands_int)
+    by_route_fmt["fuel_cost_net"]   = by_route_fmt["fuel_cost_net"].apply(de_eur0)
+    by_route_fmt["fuel_cost_gross"] = by_route_fmt["fuel_cost_gross"].apply(de_eur0)
+    st.markdown("**▶ Pe tură (litri, cost net/brut, pachete)**")
+    st.dataframe(by_route_fmt.rename(columns={
+        "route":"tură/oraș","fuel_l":"litri","fuel_cost_net":"cost (net)","fuel_cost_gross":"cost (brut)"
+    }), use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # CHART: Top orașe după consum (doar intrări Tankpool – excludem ‘PREDICT’)
+    city_df = df[(df["fuel_l"] > 0) & (df["route"].notnull())].copy()
+    city_df["route"] = city_df["route"].astype(str)
+    city_top = (city_df.groupby("route", as_index=False)["fuel_l"].sum()
+                      .sort_values("fuel_l", ascending=False)
+                      .head(10))
+    if not city_top.empty:
+        st.markdown('<div class="card"><div class="section-h">3) Top orașe după consum (L)</div>', unsafe_allow_html=True)
+        fig = px.bar(city_top, x="route", y="fuel_l",
+                     labels={"route":"oraș / rută", "fuel_l":"litri"},
+                     text=[de_thousands_int(v) for v in city_top["fuel_l"]])
+        fig.update_traces(textposition="outside")
+        fig.update_layout(yaxis_title=None, xaxis_title=None, margin=dict(l=10,r=10,t=10,b=10),
+                          uniformtext_minsize=10, uniformtext_mode='hide')
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------- RUN ----------
 if __name__ == "__main__":
-    get_conn(); main()
+    main()
