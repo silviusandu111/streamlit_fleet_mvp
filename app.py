@@ -126,4 +126,74 @@ def normalize_text(s: str) -> str:
     if not s:
         return ""
     s = s.lower()
-    s = unicodedata.normalize("NFKD", s
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
+def try_ocr_image(image_bytes: bytes) -> Optional[str]:
+    try:
+        from PIL import Image
+        import pytesseract
+        image = Image.open(io.BytesIO(image_bytes))
+        return pytesseract.image_to_string(image)
+    except Exception:
+        return None
+
+def try_ocr_pdf(pdf_bytes: bytes) -> Optional[str]:
+    try:
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text_parts.append(page.extract_text() or "")
+        return "\n".join(text_parts).strip()
+    except Exception:
+        return None
+
+# ---- predict parsers ----
+def parse_stops_geplante(text: str) -> Optional[int]:
+    if not text: return None
+    t = normalize_text(text)
+    m = re.search(r"geplante\s+zustellpaket(?:e|te)?\s*[:\-]?\s*([0-9]+)", t)
+    if m:
+        try: return int(m.group(1))
+        except: return None
+    return None
+
+def parse_driver(text: str) -> Optional[str]:
+    if not text: return None
+    t = normalize_text(text)
+    # variante: fahrer, driver, sofer
+    m = re.search(r"(fahrer|driver|sofer)\s*[:\-]?\s*([a-z0-9 ._-]{2,})", t)
+    if m:
+        val = m.group(2).strip().title()
+        return val[:50]
+    return None
+
+def parse_route(text: str) -> Optional[str]:
+    if not text: return None
+    t = normalize_text(text)
+    # variante: tour, tura, route
+    m = re.search(r"(tour|tura|route)\s*[:\-]?\s*([a-z0-9 /._-]{2,})", t)
+    if m:
+        val = m.group(2).strip().upper()
+        return val[:50]
+    return None
+
+def parse_vehicle(text: str) -> Optional[str]:
+    if not text: return None
+    t = normalize_text(text)
+    # caută o plăcuță aproximativ (litere + spațiu + litere/cifre)
+    m = re.search(r"\b([a-z]{1,3}\s?[a-z]{1,3}\s?[0-9]{1,4})\b", t)
+    if m:
+        return m.group(1).upper()[:20]
+    return None
+
+# ---- fuel parsers ----
+def parse_liters(text: str) -> Optional[float]:
+    if not text: return None
+    t = normalize_text(text)
+    m = re.search(rf"\bmenge\s+{NUM}\b", t)
+    if m:
+        try: return float(m.group(1).replace(",", "."))
+        except: pass
