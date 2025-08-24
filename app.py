@@ -2,8 +2,7 @@ import io, re, sqlite3, unicodedata, datetime as dt, calendar
 from pathlib import Path
 import pandas as pd
 import streamlit as st
-from pdfminer_high_level import extract_text as pdf_extract_text  # alias pt. claritate
-from pdfminer.high_level import extract_text  # compat
+from pdfminer.high_level import extract_text
 import plotly.express as px
 
 # OCR pentru poze (opțional, dacă nu se poate instala -> fallback manual)
