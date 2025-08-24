@@ -1,5 +1,6 @@
 streamlit>=1.36
 pandas>=2.1
+openpyxl>=3.1
 xlsxwriter>=3.2
 pillow>=10.3
 pytesseract>=0.3.10
