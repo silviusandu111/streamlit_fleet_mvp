@@ -20,7 +20,7 @@ DB_PATH = DATA_DIR / "fleet.db"; BACKUP_CSV = DATA_DIR / "entries_backup.csv"
 for p in (DATA_DIR, UPLOAD_DIR): p.mkdir(parents=True, exist_ok=True)
 
 VAT_RATE = 0.19
-FUEL_PRICE_GROSS = 1.6  # €/L (cu TVA) pt. Excel Tankpool când nu avem prețuri din PDF
+FUEL_PRICE_GROSS = 1.6  # €/L (cu TVA) pt. Excel Tankpool când nu avem prețul din fișier
 
 # ============= UI / THEME =============
 st.set_page_config(page_title=APP_TITLE, layout="wide", page_icon="⛽")
@@ -32,6 +32,7 @@ st.markdown("""
 .section-h{ font-weight:700;font-size:1.05rem;margin-bottom:8px }
 .stDataFrame { border-radius:10px;overflow:hidden }
 .file-chip{display:inline-block;margin:4px 6px;padding:6px 10px;border:1px solid #1f2937;border-radius:999px;background:#0b1220}
+.queue-row{display:flex;gap:10px;align-items:center;justify-content:space-between;border:1px solid #1f2937;padding:8px 10px;border-radius:10px;background:#0b1220}
 </style>
 """, unsafe_allow_html=True)
 
@@ -249,150 +250,161 @@ def sidebar_summary(conn, key_suffix: str):
 def main():
     st.title("SANS — Motorină (Tankpool) & Predict (pachete)")
     conn = get_conn()
+
+    # ---- Coș de fișiere în session_state ----
+    if "upload_queue" not in st.session_state: st.session_state.upload_queue = []  # listă de dict {name, data(bytes), ext}
     if "predict_manual" not in st.session_state: st.session_state.predict_manual = []
-    if "auto_refresh" not in st.session_state: st.session_state.auto_refresh = True
 
     with st.sidebar: sidebar_summary(conn, "top")
 
-    # ---- Upload ----
-    st.markdown('<div class="card"><div class="section-h">1) Încarcă fișiere</div>', unsafe_allow_html=True)
+    # ---- UI Upload (un singur fișier odată, dar adăugare în coș) ----
+    st.markdown('<div class="card"><div class="section-h">1) Adaugă fișiere în coș</div>', unsafe_allow_html=True)
     default_predict_date = st.date_input("Dată implicită pentru Predict (dacă nu se găsește în document)", dt.date.today())
-    uploads = st.file_uploader(
-        "Selectează Tankpool (Excel/PDF) sau Predict (PDF/JPG/PNG). Poți încărca mai multe odată.",
+    up_one = st.file_uploader(
+        "Alege un fișier (PDF / Excel / JPG / PNG), apoi apasă **Adaugă în coș**. Poți repeta pașii pentru mai multe fișiere.",
         type=["xls","xlsx","csv","pdf","png","jpg","jpeg"],
-        accept_multiple_files=True,
-        key="uploader_main"
+        accept_multiple_files=False,
+        key="single_uploader"
     )
-    if uploads:
-        st.write("**Fișiere selectate:**")
-        for f in uploads:
-            st.markdown(f"<span class='file-chip'>{f.name} — {len(f.getvalue())//1024} KB</span>", unsafe_allow_html=True)
-    st.checkbox("Auto-refresh după import", value=st.session_state.auto_refresh, key="auto_refresh",
-                help="Dacă e bifat, pagina se reîncarcă automat după import ca să vezi imediat totalurile.")
+    c1,c2,c3 = st.columns([1,1,2])
+    with c1:
+        if st.button("➕ Adaugă în coș", use_container_width=True, disabled=(up_one is None)):
+            buf = up_one.getvalue()
+            st.session_state.upload_queue.append({"name": up_one.name, "data": buf, "ext": Path(up_one.name).suffix.lower()})
+            # salvează fizic (opțional)
+            try:
+                with open(UPLOAD_DIR / up_one.name, "wb") as fh: fh.write(buf)
+            except Exception: pass
+            st.success(f"Adăugat: {up_one.name}")
+    with c2:
+        if st.button("🧹 Golește coșul", use_container_width=True):
+            st.session_state.upload_queue = []
+            st.info("Coș golit.")
+    with c3:
+        st.write("")
+
+    # Coș vizual
+    if st.session_state.upload_queue:
+        st.write("**Coș de fișiere:**")
+        for i,item in enumerate(st.session_state.upload_queue):
+            col1,col2 = st.columns([6,1])
+            with col1:
+                st.markdown(f"<div class='queue-row'><span>{item['name']}</span><span class='small-muted'>{len(item['data'])//1024} KB</span></div>", unsafe_allow_html=True)
+            with col2:
+                if st.button("Șterge", key=f"del_{i}"):
+                    st.session_state.upload_queue.pop(i)
+                    st.experimental_rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
-    results=[]
-    imported_any = False
+    # ---- Procesare coș ----
+    if st.session_state.upload_queue:
+        if st.button("🚀 Procesează toate", use_container_width=True, type="primary"):
+            results = []
+            imported_any = False
+            for item in list(st.session_state.upload_queue):
+                name, ext, raw = item["name"], item["ext"], item["data"]
 
-    if uploads:
-        for up in uploads:
-            name, ext = up.name, Path(up.name).suffix.lower()
-            raw = up.getvalue()
-
-            # salvează fizic (marcă vizibilă că “a intrat”)
-            try:
-                with open(UPLOAD_DIR / name, "wb") as fh: fh.write(raw)
-            except Exception: pass
-
-            # --- PDF: Tankpool sau Predict după conținut
-            if ext == ".pdf":
-                text = extract_text(io.BytesIO(raw)) or ""
-                if re.search(r"Diesel\s+[\d.,]+\s+L", text, re.IGNORECASE):
-                    dfp = parse_tankpool_pdf(raw); ins=0
-                    for _,r in dfp.iterrows():
-                        delivery = r["date"] + dt.timedelta(days=1)
+                # --- PDF: Tankpool vs Predict după conținut
+                if ext == ".pdf":
+                    text = extract_text(io.BytesIO(raw)) or ""
+                    if re.search(r"Diesel\s+[\d.,]+\s+L", text, re.IGNORECASE):
+                        dfp = parse_tankpool_pdf(raw); ins=0
+                        for _,r in dfp.iterrows():
+                            delivery = r["date"] + dt.timedelta(days=1)
+                            insert_entry(conn, {
+                                "date": delivery.isoformat(), "driver":"AUTO", "route":"AUTO", "vehicle":"AUTO",
+                                "fuel_l": float(r["fuel_l"]),
+                                "fuel_cost_net": float(r["fuel_cost_net"]),
+                                "fuel_cost_gross": float(r["fuel_cost_gross"]),
+                                "stops":0, "packages":0, "notes":"Tankpool PDF"
+                            }); ins+=1; imported_any=True
+                        results.append({"fișier":name,"tip":"TANKPOOL_PDF","rows":ins,"mesaj":"OK"})
+                        log_import(conn, name, "TANKPOOL_PDF", ins, "OK")
+                    else:
+                        total_pk = extract_packages_total(text)
+                        m = DATE_RX.search(text)
+                        d = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce").date() if m else default_predict_date
                         insert_entry(conn, {
-                            "date": delivery.isoformat(), "driver":"AUTO", "route":"AUTO", "vehicle":"AUTO",
-                            "fuel_l": float(r["fuel_l"]),
-                            "fuel_cost_net": float(r["fuel_cost_net"]),
-                            "fuel_cost_gross": float(r["fuel_cost_gross"]),
-                            "stops":0, "packages":0, "notes":"Tankpool PDF"
-                        }); ins+=1; imported_any = True
-                    results.append({"fișier":name,"tip":"TANKPOOL_PDF","rows":ins,"mesaj":"OK"})
-                    log_import(conn, name, "TANKPOOL_PDF", ins, "OK")
-                    st.toast(f"PDF Tankpool: importat {ins} rânduri", icon="✅")
-                else:
-                    total_pk = extract_packages_total(text)
-                    m = DATE_RX.search(text)
-                    d = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce").date() if m else default_predict_date
-                    insert_entry(conn, {
-                        "date": d.isoformat(), "driver":"AUTO", "route":"PREDICT", "vehicle":"AUTO",
-                        "fuel_l":0, "fuel_cost_net":0, "fuel_cost_gross":0, "stops":0, "packages": int(total_pk),
-                        "notes":"Predict PDF (total pachete)"
-                    }); imported_any = True
-                    results.append({"fișier":name,"tip":"PREDICT_PDF","rows":1,"mesaj":f"pachete={int(total_pk)}"})
-                    log_import(conn, name, "PREDICT_PDF", 1, f"pachete={int(total_pk)}")
-                    st.toast(f"Predict PDF: pachete={int(total_pk)}", icon="📦")
-                continue
-
-            # --- IMAGINI (Predict)
-            if ext in (".png",".jpg",".jpeg"):
-                txt = ocr_image_to_text(raw)
-                total_pk = extract_packages_total(txt) if txt else 0
-                if total_pk > 0:
-                    insert_entry(conn, {
-                        "date": default_predict_date.isoformat(), "driver":"AUTO", "route":"PREDICT", "vehicle":"AUTO",
-                        "fuel_l":0, "fuel_cost_net":0, "fuel_cost_gross":0, "stops":0, "packages": int(total_pk),
-                        "notes":"Predict IMG OCR (total pachete)"
-                    }); imported_any = True
-                    results.append({"fișier":name,"tip":"PREDICT_IMG","rows":1,"mesaj":f"pachete={int(total_pk)}"})
-                    log_import(conn, name, "PREDICT_IMG", 1, f"pachete={int(total_pk)}")
-                    st.toast(f"Predict IMG: pachete={int(total_pk)}", icon="📦")
-                else:
-                    st.session_state.predict_manual.append({"name": name, "date": default_predict_date})
-                    results.append({"fișier":name,"tip":"PREDICT_IMG","rows":0,"mesaj":"OCR n/a — formular manual"})
-                    log_import(conn, name, "PREDICT_IMG", 0, "OCR n/a — manual")
-                    st.toast(f"{name}: OCR nu a găsit pachete. Completează manual mai jos.", icon="✍️")
-                continue
-
-            # --- EXCEL/CSV (Tankpool)
-            if ext in (".xls",".xlsx",".csv"):
-                if ext != ".csv":
-                    df_x = pd.read_excel(io.BytesIO(raw), dtype=str)
-                else:
-                    df_x = pd.read_csv(io.BytesIO(raw), dtype=str, sep=None, engine="python")
-                # normalizez antetele uzuale
-                if "Tankmenge" not in df_x.columns:
-                    for alt in ["Menge","Liter","Betankte Menge","Tankmenge [l]"]:
-                        if alt in df_x.columns: df_x.rename(columns={alt:"Tankmenge"}, inplace=True)
-                if "Datum" not in df_x.columns:
-                    for alt in ["Date","Belegdatum","Tankdatum","Datum Tankung"]:
-                        if alt in df_x.columns: df_x.rename(columns={alt:"Datum"}, inplace=True)
-                if "Kennzeichen" not in df_x.columns:
-                    for alt in ["Fahrzeug","Kennz","Kennz.","Ort","Route"]:
-                        if alt in df_x.columns: df_x.rename(columns={alt:"Kennzeichen"}, inplace=True)
-
-                if "Tankmenge" not in df_x.columns or "Datum" not in df_x.columns:
-                    msg = f"Coloane lipsă. Găsite: {list(df_x.columns)}"
-                    results.append({"fișier":name,"tip":"ERROR","rows":0,"mesaj":msg})
-                    log_import(conn, name, "ERROR", 0, msg)
-                    st.error(f"{name}: {msg}")
+                            "date": d.isoformat(), "driver":"AUTO", "route":"PREDICT", "vehicle":"AUTO",
+                            "fuel_l":0, "fuel_cost_net":0, "fuel_cost_gross":0, "stops":0, "packages": int(total_pk),
+                            "notes":"Predict PDF (total pachete)"
+                        }); imported_any=True
+                        results.append({"fișier":name,"tip":"PREDICT_PDF","rows":1,"mesaj":f"pachete={int(total_pk)}"})
+                        log_import(conn, name, "PREDICT_PDF", 1, f"pachete={int(total_pk)}")
                     continue
 
-                liters_series = parse_liters_series(df_x["Tankmenge"])
-                ins=0
-                for idx,row in df_x.iterrows():
-                    liters = float(liters_series.iloc[idx])
-                    if liters<=0: continue
-                    try: refuel = pd.to_datetime(row.get("Datum"), dayfirst=True, errors="coerce").date()
-                    except: refuel = dt.date.today()
-                    delivery = refuel + dt.timedelta(days=1)
-                    route = (str(row.get("Kennzeichen","AUTO")).strip() or "AUTO").upper()
-                    gross = liters * FUEL_PRICE_GROSS
-                    net   = gross / (1+VAT_RATE)
-                    insert_entry(conn, {
-                        "date": delivery.isoformat(), "driver":"AUTO", "route": route, "vehicle": route,
-                        "fuel_l": liters, "fuel_cost_net": net, "fuel_cost_gross": gross,
-                        "stops":0, "packages":0, "notes":"Tankpool Excel"
-                    }); ins+=1; imported_any = True
-                results.append({"fișier":name,"tip":"TANKPOOL_EXCEL","rows":ins,"mesaj":"OK"})
-                log_import(conn, name, "TANKPOOL_EXCEL", ins, "OK")
-                st.toast(f"Excel Tankpool: importat {ins} rânduri", icon="✅")
-                continue
+                # --- IMG (Predict)
+                if ext in (".png",".jpg",".jpeg"):
+                    txt = ocr_image_to_text(raw)
+                    total_pk = extract_packages_total(txt) if txt else 0
+                    if total_pk > 0:
+                        insert_entry(conn, {
+                            "date": default_predict_date.isoformat(), "driver":"AUTO", "route":"PREDICT", "vehicle":"AUTO",
+                            "fuel_l":0, "fuel_cost_net":0, "fuel_cost_gross":0, "stops":0, "packages": int(total_pk),
+                            "notes":"Predict IMG OCR (total pachete)"
+                        }); imported_any=True
+                        results.append({"fișier":name,"tip":"PREDICT_IMG","rows":1,"mesaj":f"pachete={int(total_pk)}"})
+                        log_import(conn, name, "PREDICT_IMG", 1, f"pachete={int(total_pk)}")
+                    else:
+                        st.session_state.predict_manual.append({"name": name, "date": default_predict_date})
+                        results.append({"fișier":name,"tip":"PREDICT_IMG","rows":0,"mesaj":"OCR n/a — formular manual"})
+                        log_import(conn, name, "PREDICT_IMG", 0, "OCR n/a — manual")
+                    continue
 
-        # Rezumat procesare + refresh sidebar după batch
-        if results:
-            st.success("Procesare terminată ✅")
-            st.dataframe(pd.DataFrame(results), use_container_width=True)
+                # --- EXCEL/CSV (Tankpool)
+                if ext in (".xls",".xlsx",".csv"):
+                    if ext != ".csv":
+                        df_x = pd.read_excel(io.BytesIO(raw), dtype=str)
+                    else:
+                        df_x = pd.read_csv(io.BytesIO(raw), dtype=str, sep=None, engine="python")
+                    if "Tankmenge" not in df_x.columns:
+                        for alt in ["Menge","Liter","Betankte Menge","Tankmenge [l]"]:
+                            if alt in df_x.columns: df_x.rename(columns={alt:"Tankmenge"}, inplace=True)
+                    if "Datum" not in df_x.columns:
+                        for alt in ["Date","Belegdatum","Tankdatum","Datum Tankung"]:
+                            if alt in df_x.columns: df_x.rename(columns={alt:"Datum"}, inplace=True)
+                    if "Kennzeichen" not in df_x.columns:
+                        for alt in ["Fahrzeug","Kennz","Kennz.","Ort","Route"]:
+                            if alt in df_x.columns: df_x.rename(columns={alt:"Kennzeichen"}, inplace=True)
+
+                    if "Tankmenge" not in df_x.columns or "Datum" not in df_x.columns:
+                        msg = f"Coloane lipsă. Găsite: {list(df_x.columns)}"
+                        results.append({"fișier":name,"tip":"ERROR","rows":0,"mesaj":msg})
+                        log_import(conn, name, "ERROR", 0, msg)
+                        continue
+
+                    liters_series = parse_liters_series(df_x["Tankmenge"])
+                    ins=0
+                    for idx,row in df_x.iterrows():
+                        liters = float(liters_series.iloc[idx])
+                        if liters<=0: continue
+                        try: refuel = pd.to_datetime(row.get("Datum"), dayfirst=True, errors="coerce").date()
+                        except: refuel = dt.date.today()
+                        delivery = refuel + dt.timedelta(days=1)
+                        route = (str(row.get("Kennzeichen","AUTO")).strip() or "AUTO").upper()
+                        gross = liters * FUEL_PRICE_GROSS
+                        net   = gross / (1+VAT_RATE)
+                        insert_entry(conn, {
+                            "date": delivery.isoformat(), "driver":"AUTO", "route": route, "vehicle": route,
+                            "fuel_l": liters, "fuel_cost_net": net, "fuel_cost_gross": gross,
+                            "stops":0, "packages":0, "notes":"Tankpool Excel"
+                        }); ins+=1; imported_any=True
+                    results.append({"fișier":name,"tip":"TANKPOOL_EXCEL","rows":ins,"mesaj":"OK"})
+                    log_import(conn, name, "TANKPOOL_EXCEL", ins, "OK")
+                    continue
+
+            # Afișează rezultatele + curăță coșul
+            if results:
+                st.success("Procesare terminată ✅")
+                st.dataframe(pd.DataFrame(results), use_container_width=True)
+            st.session_state.upload_queue = []
+
+            # Reîmprospătează thumbnail-urile
             with st.sidebar:
                 st.divider()
-                sidebar_summary(conn, "after_upload")
+                sidebar_summary(conn, "after_batch")
 
-        # Reîncarcă pagina automat ca să vezi cifrele actualizate în thumbnail
-        if imported_any and st.session_state.auto_refresh:
-            st.experimental_rerun()
-
-    # ---- Formular manual pentru imaginile Predict fără OCR ----
+    # ---- Formular manual pentru imagini Predict fără OCR ----
     if st.session_state.predict_manual:
         st.markdown('<div class="card"><div class="section-h">Completare manuală (Predict imagini)</div>', unsafe_allow_html=True)
         keep=[]
