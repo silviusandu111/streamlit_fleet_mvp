@@ -4,7 +4,7 @@ openpyxl>=3.1
 xlsxwriter>=3.2
 pdfminer.six>=20240706
 plotly>=5.22
-# OCR e opțional; dacă instalarea eșuează pe cloud, aplicația face fallback manual
+# OCR (opțional) – dacă nu se poate instala, aplicația cade pe formular manual
 easyocr>=1.7.1
 numpy>=1.26
 Pillow>=10.3
